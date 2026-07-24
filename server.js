@@ -206,7 +206,7 @@ app.get("/api/priest-users/:priestName", async (req, res) => {
 
     res.json(Array.from(usersMap.values()));
   } catch (err) {
-    res.status(500).json({ success: false,, error: err.message });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
