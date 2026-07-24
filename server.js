@@ -503,6 +503,5 @@ app.patch("/api/bookings/:id", async (req, res) => {
       success: false,
       error: err.message
     });
-
   }
 });
