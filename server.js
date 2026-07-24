@@ -1,5 +1,5 @@
 const express = require("express");
-const mongoose = require("mongoose");
+const { MongoClient, ObjectId } = require("mongodb");
 const cors = require("cors");
 require("dotenv").config();
 
@@ -14,65 +14,57 @@ app.use(cors({
 app.use(express.json());
 
 const MONGO_URI = process.env.MONGO_URI || "mongodb://localhost:27017/booking-app";
-mongoose.connect(MONGO_URI)
-  .then(() => console.log("Connected to MongoDB successfully"))
-  .catch((err) => console.error("MongoDB connection error:", err));
+const client = new MongoClient(MONGO_URI);
 
-const userSchema = new mongoose.Schema({
-  fullName: { type: String, required: true },
-  birthDate: { type: String, required: true },
-  phone: { type: String, required: true, unique: true },
-  password: { type: String, required: true }
-});
-const User = mongoose.model("User", userSchema);
+let db;
 
-const priestSchema = new mongoose.Schema({
-  name: { type: String, required: true, unique: true },
-  password: { type: String, required: true }
-});
-const Priest = mongoose.model("Priest", priestSchema);
+async function startServer() {
+  try {
+    await client.connect();
+    db = client.db(); // سيستخدم القاعدة الموجودة في الـ URI تلقائياً
+    console.log("Connected to MongoDB successfully");
 
-const slotSchema = new mongoose.Schema({
-  priestName: { type: String, required: true },
-  date: { type: String, required: true },
-  maxSlots: { type: Number, default: 5 },
-  bookedCount: { type: Number, default: 0 }
-});
-const Slot = mongoose.model("Slot", slotSchema);
+    const PORT = process.env.PORT || 5000;
+    app.listen(PORT, () => {
+      console.log(`Server is running on port ${PORT}`);
+    });
+  } catch (err) {
+    console.error("MongoDB connection error:", err);
+  }
+}
 
-const bookingSchema = new mongoose.Schema({
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
-  priestName: { type: String, required: true },
-  date: { type: String, required: true },
-  status: { type: String, enum: ["pending", "accepted", "rejected"], default: "pending" },
-  queueNumber: { type: Number, default: null }
-});
-const Booking = mongoose.model("Booking", bookingSchema);
+startServer();
 
+// الصفحة الرئيسية
 app.get("/", (req, res) => {
   res.send("Booking App Backend is running successfully!");
 });
 
+// تسجيل مستخدم جديد
 app.post("/api/register", async (req, res) => {
   try {
     const { fullName, birthDate, phone, password } = req.body;
-    const existingUser = await User.findOne({ phone });
+    const usersCollection = db.collection("users");
+
+    const existingUser = await usersCollection.findOne({ phone });
     if (existingUser) {
       return res.status(400).json({ success: false, error: "رقم الهاتف مستخدم بالفعل" });
     }
 
-    const newUser = new User({ fullName, birthDate, phone, password });
-    await newUser.save();
-    res.json({ success: true, userId: newUser._id });
+    const result = await usersCollection.insertOne({ fullName, birthDate, phone, password });
+    res.json({ success: true, userId: result.insertedId });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
+// تسجيل دخول مستخدم
 app.post("/api/login", async (req, res) => {
   try {
     const { phone, password } = req.body;
-    const user = await User.findOne({ phone, password });
+    const usersCollection = db.collection("users");
+
+    const user = await usersCollection.findOne({ phone, password });
     if (!user) {
       return res.status(400).json({ success: false, error: "رقم الهاتف أو كلمة المرور غير صحيحة" });
     }
@@ -82,14 +74,18 @@ app.post("/api/login", async (req, res) => {
   }
 });
 
+// تسجيل دخول الكاهن
 app.post("/api/priest-login", async (req, res) => {
   try {
     const { name, password } = req.body;
-    let priest = await Priest.findOne({ name });
+    const priestsCollection = db.collection("priests");
+
+    let priest = await priestsCollection.findOne({ name });
     
     if (!priest && password === "123") {
-      priest = new Priest({ name, password });
-      await priest.save();
+      const newPriest = { name, password };
+      const result = await priestsCollection.insertOne(newPriest);
+      priest = { _id: result.insertedId, ...newPriest };
     }
 
     if (!priest || priest.password !== password) {
@@ -102,10 +98,13 @@ app.post("/api/priest-login", async (req, res) => {
   }
 });
 
+// جلب المواعيد المتاحة
 app.get("/api/priest-slots", async (req, res) => {
   try {
     const { priestName } = req.query;
-    let slots = await Slot.find({ priestName });
+    const slotsCollection = db.collection("slots");
+
+    let slots = await slotsCollection.find({ priestName }).toArray();
 
     if (slots.length === 0) {
       const today = new Date();
@@ -116,15 +115,17 @@ app.get("/api/priest-slots", async (req, res) => {
         defaultDates.push(d.toISOString().split("T")[0]);
       }
       for (let d of defaultDates) {
-        await Slot.create({ priestName, date: d, maxSlots: 5, bookedCount: 0 });
+        await slotsCollection.insertOne({ priestName, date: d, maxSlots: 5, bookedCount: 0 });
       }
-      slots = await Slot.find({ priestName });
+      slots = await slotsCollection.find({ priestName }).toArray();
     }
 
-    const formattedSlots = slots.map(s => ({
-      date: s.date,
-      slotsLeft: s.maxSlots - s.bookedCount
-    }));
+    const formattedSlots = slots
+      .map(s => ({
+        date: s.date,
+        slotsLeft: s.maxSlots - s.bookedCount
+      }))
+      .filter(s => s.slotsLeft > 0);
 
     res.json(formattedSlots);
   } catch (err) {
@@ -132,55 +133,85 @@ app.get("/api/priest-slots", async (req, res) => {
   }
 });
 
+// حجز موعد جديد
 app.post("/api/bookings", async (req, res) => {
   try {
     const { userId, priestName, date } = req.body;
-    
-    let slot = await Slot.findOne({ priestName, date });
+    const slotsCollection = db.collection("slots");
+    const bookingsCollection = db.collection("bookings");
+
+    let slot = await slotsCollection.findOne({ priestName, date });
     if (!slot) {
-      slot = await Slot.create({ priestName, date, maxSlots: 5, bookedCount: 0 });
+      const newSlot = { priestName, date, maxSlots: 5, bookedCount: 0 };
+      const result = await slotsCollection.insertOne(newSlot);
+      slot = { _id: result.insertedId, ...newSlot };
     }
 
     if (slot.bookedCount >= slot.maxSlots) {
       return res.status(400).json({ success: false, error: "عذراً، هذا الموعد لم يعد متاحاً أو اكتمل العدد" });
     }
 
-    const newBooking = new Booking({
-      userId,
+    const newBooking = {
+      userId: new ObjectId(userId),
       priestName,
       date,
-      status: "pending"
-    });
+      status: "pending",
+      queueNumber: null
+    };
 
-    await newBooking.save();
+    const result = await bookingsCollection.insertOne(newBooking);
     
-    slot.bookedCount += 1;
-    await slot.save();
+    await slotsCollection.updateOne(
+      { _id: slot._id },
+      { $inc: { bookedCount: 1 } }
+    );
 
-    res.json({ success: true, bookingId: newBooking._id });
+    res.json({ success: true, bookingId: result.insertedId });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
+// جلب حجوزات المستخدم
 app.get("/api/user-bookings/:userId", async (req, res) => {
   try {
     const { userId } = req.params;
-    const bookings = await Booking.find({ userId });
+    const bookingsCollection = db.collection("bookings");
+    const bookings = await bookingsCollection.find({ userId: new ObjectId(userId) }).toArray();
     res.json(bookings);
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
+// جلب حجوزات الكاهن
 app.get("/api/bookings/:priestName", async (req, res) => {
   try {
     const priestName = decodeURIComponent(req.params.priestName);
-    const bookings = await Booking.find({ priestName }).populate("userId", "fullName phone birthDate");
-    
+    const bookingsCollection = db.collection("bookings");
+
+    // محاكاة الـ populate عبر Aggregation Pipeline
+    const bookings = await bookingsCollection.aggregate([
+      { $match: { priestName } },
+      {
+        $lookup: {
+          from: "users",
+          localField: "userId",
+          foreignField: "_id",
+          as: "userProfile"
+        }
+      },
+      { $unwind: { path: "$userProfile", preserveNullAndEmptyArrays: true } }
+    ]).toArray();
+
     const formatted = bookings.map(b => ({
       _id: b._id,
-      userProfile: b.userId,
+      userProfile: b.userProfile ? {
+        _id: b.userProfile._id,
+        fullName: b.userProfile.fullName,
+        phone: b.userProfile.phone,
+        birthDate: b.userProfile.birthDate
+      } : null,
       date: b.date,
       status: b.status,
       queueNumber: b.queueNumber
@@ -192,15 +223,34 @@ app.get("/api/bookings/:priestName", async (req, res) => {
   }
 });
 
+// جلب سجل المترددين للكاهن
 app.get("/api/priest-users/:priestName", async (req, res) => {
   try {
     const priestName = decodeURIComponent(req.params.priestName);
-    const bookings = await Booking.find({ priestName, status: "accepted" }).populate("userId", "fullName phone birthDate");
-    
+    const bookingsCollection = db.collection("bookings");
+
+    const bookings = await bookingsCollection.aggregate([
+      { $match: { priestName, status: "accepted" } },
+      {
+        $lookup: {
+          from: "users",
+          localField: "userId",
+          foreignField: "_id",
+          as: "userProfile"
+        }
+      },
+      { $unwind: "$userProfile" }
+    ]).toArray();
+
     const usersMap = new Map();
     bookings.forEach(b => {
-      if (b.userId) {
-        usersMap.set(b.userId._id.toString(), b.userId);
+      if (b.userProfile) {
+        usersMap.set(b.userProfile._id.toString(), {
+          _id: b.userProfile._id,
+          fullName: b.userProfile.fullName,
+          phone: b.userProfile.phone,
+          birthDate: b.userProfile.birthDate
+        });
       }
     });
 
@@ -210,41 +260,44 @@ app.get("/api/priest-users/:priestName", async (req, res) => {
   }
 });
 
+// تحديث حالة الحجز (قبول / رفض)
 app.patch("/api/bookings/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
+    const bookingsCollection = db.collection("bookings");
+    const slotsCollection = db.collection("slots");
 
-    const booking = await Booking.findById(id);
+    const booking = await bookingsCollection.findOne({ _id: new ObjectId(id) });
     if (!booking) {
       return res.status(404).json({ success: false, error: "الحجز غير موجود" });
     }
 
+    let queueNumber = booking.queueNumber;
+
     if (status === "accepted" && booking.status !== "accepted") {
-      const acceptedCount = await Booking.countDocuments({
+      const acceptedCount = await bookingsCollection.countDocuments({
         priestName: booking.priestName,
         date: booking.date,
         status: "accepted"
       });
-      booking.queueNumber = acceptedCount + 1;
+      queueNumber = acceptedCount + 1;
     } else if (status === "rejected" && booking.status === "accepted") {
-      await Slot.findOneAndUpdate(
+      await slotsCollection.updateOne(
         { priestName: booking.priestName, date: booking.date },
         { $inc: { bookedCount: -1 } }
       );
-      booking.queueNumber = null;
+      queueNumber = null;
     }
 
-    booking.status = status;
-    await booking.save();
+    await bookingsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { status, queueNumber } }
+    );
 
-    res.json({ success: true, booking });
+    const updatedBooking = await bookingsCollection.findOne({ _id: new ObjectId(id) });
+    res.json({ success: true, booking: updatedBooking });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
-});
-
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
 });
