@@ -21,7 +21,7 @@ let db;
 async function startServer() {
   try {
     await client.connect();
-    db = client.db(); // سيستخدم القاعدة الموجودة في الـ URI تلقائياً
+    db = client.db();
     console.log("Connected to MongoDB successfully");
 
     const PORT = process.env.PORT || 5000;
@@ -35,12 +35,20 @@ async function startServer() {
 
 startServer();
 
-// الصفحة الرئيسية
-app.get("/", (req, res) => {
-  res.send("Booking App Backend is running successfully!");
+app.get("/api/users/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const usersCollection = db.collection("users");
+    const user = await usersCollection.findOne({ _id: new ObjectId(id) });
+    if (!user) {
+      return res.status(404).json({ success: false, error: "المستخدم غير موجود" });
+    }
+    res.json({ success: true, user: { id: user._id, fullName: user.fullName } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
-// تسجيل مستخدم جديد
 app.post("/api/register", async (req, res) => {
   try {
     const { fullName, birthDate, phone, password } = req.body;
@@ -58,7 +66,6 @@ app.post("/api/register", async (req, res) => {
   }
 });
 
-// تسجيل دخول مستخدم
 app.post("/api/login", async (req, res) => {
   try {
     const { phone, password } = req.body;
@@ -74,7 +81,6 @@ app.post("/api/login", async (req, res) => {
   }
 });
 
-// تسجيل دخول الكاهن
 app.post("/api/priest-login", async (req, res) => {
   try {
     const { name, password } = req.body;
@@ -92,13 +98,12 @@ app.post("/api/priest-login", async (req, res) => {
       return res.status(400).json({ success: false, error: "بيانات دخول الكاهن غير صحيحة" });
     }
 
-    res.json({ success: true, priest: { name: priest.name } });
+    res.json({ success: true, priest: { id: priest._id, name: priest.name } });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// جلب المواعيد المتاحة
 app.get("/api/priest-slots", async (req, res) => {
   try {
     const { priestName } = req.query;
@@ -133,7 +138,6 @@ app.get("/api/priest-slots", async (req, res) => {
   }
 });
 
-// حجز موعد جديد
 app.post("/api/bookings", async (req, res) => {
   try {
     const { userId, priestName, date } = req.body;
@@ -172,7 +176,6 @@ app.post("/api/bookings", async (req, res) => {
   }
 });
 
-// جلب حجوزات المستخدم
 app.get("/api/user-bookings/:userId", async (req, res) => {
   try {
     const { userId } = req.params;
@@ -184,13 +187,11 @@ app.get("/api/user-bookings/:userId", async (req, res) => {
   }
 });
 
-// جلب حجوزات الكاهن
 app.get("/api/bookings/:priestName", async (req, res) => {
   try {
     const priestName = decodeURIComponent(req.params.priestName);
     const bookingsCollection = db.collection("bookings");
 
-    // محاكاة الـ populate عبر Aggregation Pipeline
     const bookings = await bookingsCollection.aggregate([
       { $match: { priestName } },
       {
@@ -223,7 +224,6 @@ app.get("/api/bookings/:priestName", async (req, res) => {
   }
 });
 
-// جلب سجل المترددين للكاهن
 app.get("/api/priest-users/:priestName", async (req, res) => {
   try {
     const priestName = decodeURIComponent(req.params.priestName);
@@ -260,7 +260,6 @@ app.get("/api/priest-users/:priestName", async (req, res) => {
   }
 });
 
-// تحديث حالة الحجز (قبول / رفض)
 app.patch("/api/bookings/:id", async (req, res) => {
   try {
     const { id } = req.params;
