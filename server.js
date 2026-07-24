@@ -1,6 +1,7 @@
 const express = require("express");
 const { MongoClient, ObjectId } = require("mongodb");
 const cors = require("cors");
+const bcrypt = require("bcrypt");
 require("dotenv").config();
 
 const app = express();
@@ -52,55 +53,155 @@ app.get("/api/users/:id", async (req, res) => {
 app.post("/api/register", async (req, res) => {
   try {
     const { fullName, birthDate, phone, password } = req.body;
+
     const usersCollection = db.collection("users");
 
     const existingUser = await usersCollection.findOne({ phone });
+
     if (existingUser) {
-      return res.status(400).json({ success: false, error: "رقم الهاتف مستخدم بالفعل" });
+      return res.status(400).json({
+        success: false,
+        error: "رقم الهاتف مستخدم بالفعل"
+      });
     }
 
-    const result = await usersCollection.insertOne({ fullName, birthDate, phone, password });
-    res.json({ success: true, userId: result.insertedId });
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const result = await usersCollection.insertOne({
+      fullName,
+      birthDate,
+      phone,
+      password: hashedPassword
+    });
+
+    res.json({
+      success: true,
+      userId: result.insertedId
+    });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
+app.post("/api/create-priest", async (req, res) => {
+  try {
+    const { name, password } = req.body;
+
+    if (!name || !password) {
+      return res.status(400).json({
+        success: false,
+        error: "الاسم وكلمة المرور مطلوبان"
+      });
+    }
+
+    const priestsCollection = db.collection("priests");
+
+    const existingPriest = await priestsCollection.findOne({ name });
+
+    if (existingPriest) {
+      return res.status(400).json({
+        success: false,
+        error: "الكاهن موجود بالفعل"
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const result = await priestsCollection.insertOne({
+      name,
+      password: hashedPassword
+    });
+
+    res.json({
+      success: true,
+      priestId: result.insertedId
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
   }
 });
 
 app.post("/api/login", async (req, res) => {
   try {
     const { phone, password } = req.body;
+
     const usersCollection = db.collection("users");
 
-    const user = await usersCollection.findOne({ phone, password });
+    const user = await usersCollection.findOne({ phone });
+
     if (!user) {
-      return res.status(400).json({ success: false, error: "رقم الهاتف أو كلمة المرور غير صحيحة" });
+      return res.status(400).json({
+        success: false,
+        error: "رقم الهاتف أو كلمة المرور غير صحيحة"
+      });
     }
-    res.json({ success: true, user: { id: user._id, fullName: user.fullName } });
+
+    const match = await bcrypt.compare(password, user.password);
+
+    if (!match) {
+      return res.status(400).json({
+        success: false,
+        error: "رقم الهاتف أو كلمة المرور غير صحيحة"
+      });
+    }
+
+    res.json({
+      success: true,
+      user: {
+        id: user._id,
+        fullName: user.fullName
+      }
+    });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
   }
 });
 
 app.post("/api/priest-login", async (req, res) => {
   try {
     const { name, password } = req.body;
+
     const priestsCollection = db.collection("priests");
 
-    let priest = await priestsCollection.findOne({ name });
-    
-    if (!priest && password === "123") {
-      const newPriest = { name, password };
-      const result = await priestsCollection.insertOne(newPriest);
-      priest = { _id: result.insertedId, ...newPriest };
+    const priest = await priestsCollection.findOne({ name });
+
+    if (!priest) {
+      return res.status(400).json({
+        success: false,
+        error: "الكاهن غير موجود"
+      });
     }
 
-    if (!priest || priest.password !== password) {
-      return res.status(400).json({ success: false, error: "بيانات دخول الكاهن غير صحيحة" });
+    const match = await bcrypt.compare(password, priest.password);
+
+    if (!match) {
+      return res.status(400).json({
+        success: false,
+        error: "بيانات دخول الكاهن غير صحيحة"
+      });
     }
 
-    res.json({ success: true, priest: { id: priest._id, name: priest.name } });
+    res.json({
+      success: true,
+      priest: {
+        id: priest._id,
+        name: priest.name
+      }
+    });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
   }
 });
 
@@ -141,38 +242,73 @@ app.get("/api/priest-slots", async (req, res) => {
 app.post("/api/bookings", async (req, res) => {
   try {
     const { userId, priestName, date } = req.body;
+
     const slotsCollection = db.collection("slots");
     const bookingsCollection = db.collection("bookings");
 
-    let slot = await slotsCollection.findOne({ priestName, date });
+    const existingBooking = await bookingsCollection.findOne({
+      userId: new ObjectId(userId),
+      priestName,
+      date,
+      status: { $in: ["pending", "accepted"] }
+    });
+
+    if (existingBooking) {
+      return res.status(400).json({
+        success: false,
+        error: "لقد قمت بحجز هذا الموعد بالفعل"
+      });
+    }
+
+    const slot = await slotsCollection.findOne({
+      priestName,
+      date
+    });
+
     if (!slot) {
-      const newSlot = { priestName, date, maxSlots: 5, bookedCount: 0 };
-      const result = await slotsCollection.insertOne(newSlot);
-      slot = { _id: result.insertedId, ...newSlot };
+      return res.status(404).json({
+        success: false,
+        error: "الموعد غير موجود"
+      });
     }
 
     if (slot.bookedCount >= slot.maxSlots) {
-      return res.status(400).json({ success: false, error: "عذراً، هذا الموعد لم يعد متاحاً أو اكتمل العدد" });
+      return res.status(400).json({
+        success: false,
+        error: "اكتمل العدد لهذا الموعد"
+      });
     }
 
-    const newBooking = {
+    const result = await bookingsCollection.insertOne({
       userId: new ObjectId(userId),
       priestName,
       date,
       status: "pending",
-      queueNumber: null
-    };
+      queueNumber: null,
+      createdAt: new Date()
+    });
 
-    const result = await bookingsCollection.insertOne(newBooking);
-    
     await slotsCollection.updateOne(
-      { _id: slot._id },
-      { $inc: { bookedCount: 1 } }
+      {
+        _id: slot._id
+      },
+      {
+        $inc: {
+          bookedCount: 1
+        }
+      }
     );
 
-    res.json({ success: true, bookingId: result.insertedId });
+    res.json({
+      success: true,
+      bookingId: result.insertedId
+    });
+
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
   }
 });
 
@@ -264,39 +400,109 @@ app.patch("/api/bookings/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
+
     const bookingsCollection = db.collection("bookings");
     const slotsCollection = db.collection("slots");
 
-    const booking = await bookingsCollection.findOne({ _id: new ObjectId(id) });
+    const booking = await bookingsCollection.findOne({
+      _id: new ObjectId(id)
+    });
+
     if (!booking) {
-      return res.status(404).json({ success: false, error: "الحجز غير موجود" });
+      return res.status(404).json({
+        success: false,
+        error: "الحجز غير موجود"
+      });
+    }
+
+    if (booking.status === status) {
+      return res.json({
+        success: true
+      });
     }
 
     let queueNumber = booking.queueNumber;
 
-    if (status === "accepted" && booking.status !== "accepted") {
+    if (status === "accepted") {
+
       const acceptedCount = await bookingsCollection.countDocuments({
         priestName: booking.priestName,
         date: booking.date,
         status: "accepted"
       });
+
       queueNumber = acceptedCount + 1;
-    } else if (status === "rejected" && booking.status === "accepted") {
-      await slotsCollection.updateOne(
-        { priestName: booking.priestName, date: booking.date },
-        { $inc: { bookedCount: -1 } }
-      );
+
+    }
+
+    if (status === "rejected") {
+
+      if (booking.status !== "rejected") {
+
+        await slotsCollection.updateOne(
+          {
+            priestName: booking.priestName,
+            date: booking.date
+          },
+          {
+            $inc: {
+              bookedCount: -1
+            }
+          }
+        );
+
+      }
+
+      if (booking.queueNumber) {
+
+        await bookingsCollection.updateMany(
+          {
+            priestName: booking.priestName,
+            date: booking.date,
+            queueNumber: {
+              $gt: booking.queueNumber
+            }
+          },
+          {
+            $inc: {
+              queueNumber: -1
+            }
+          }
+        );
+
+      }
+
       queueNumber = null;
+
     }
 
     await bookingsCollection.updateOne(
-      { _id: new ObjectId(id) },
-      { $set: { status, queueNumber } }
+      {
+        _id: booking._id
+      },
+      {
+        $set: {
+          status,
+          queueNumber
+        }
+      }
     );
 
-    const updatedBooking = await bookingsCollection.findOne({ _id: new ObjectId(id) });
-    res.json({ success: true, booking: updatedBooking });
+    const updatedBooking = await bookingsCollection.findOne({
+      _id: booking._id
+    });
+
+    res.json({
+      success: true,
+      booking: updatedBooking
+    });
+
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+
   }
 });
