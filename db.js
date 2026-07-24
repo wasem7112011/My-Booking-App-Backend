@@ -7,7 +7,7 @@ const client = new MongoClient(process.env.MONGO_URI);
 
 await client.connect();
 
-const db = client.db("Booking");
+const db = client.db("test");
 
 export const users = db.collection("users");
 export const priests = db.collection("priests");

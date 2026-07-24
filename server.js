@@ -19,11 +19,34 @@ const client = new MongoClient(MONGO_URI);
 
 let db;
 
-async function startServer() {
+async function deleteExpiredBookings() {
+  const today = new Date().toISOString().split("T")[0];
+
+  await db.collection("bookings").deleteMany({
+    date: { $lt: today }
+  });
+
+  await db.collection("priestSlots").deleteMany({
+    date: { $lt: today }
+  });
+}
+
+async function startServer() {  
   try {
     await client.connect();
     db = client.db();
+
     console.log("Connected to MongoDB successfully");
+
+    await deleteExpiredBookings();
+
+    setInterval(async () => {
+      try {
+        await deleteExpiredBookings();
+      } catch (err) {
+        console.error(err);
+      }
+    }, 1000 * 60 * 60);
 
     const PORT = process.env.PORT || 5000;
     app.listen(PORT, () => {
@@ -127,6 +150,35 @@ app.post("/api/create-priest", async (req, res) => {
   }
 });
 
+app.post("/api/priest-slots", async (req, res) => {
+  try {
+    const {
+      priestName,
+      date,
+      startTime,
+      slotsLeft
+    } = req.body;
+
+    await db.collection("priestSlots").insertOne({
+      priestName,
+      date,
+      startTime,
+      maxSlots: Number(slotsLeft),
+      bookedCount: 0,
+      createdAt: new Date()
+    });
+
+    res.json({
+      success: true
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
 app.post("/api/login", async (req, res) => {
   try {
     const { phone, password } = req.body;
@@ -208,30 +260,19 @@ app.post("/api/priest-login", async (req, res) => {
 app.get("/api/priest-slots", async (req, res) => {
   try {
     const { priestName } = req.query;
-    const slotsCollection = db.collection("slots");
+    const slotsCollection = db.collection("priestSlots");
 
     let slots = await slotsCollection.find({ priestName }).toArray();
 
-    if (slots.length === 0) {
-      const today = new Date();
-      const defaultDates = [];
-      for (let i = 1; i <= 7; i++) {
-        const d = new Date(today);
-        d.setDate(today.getDate() + i);
-        defaultDates.push(d.toISOString().split("T")[0]);
-      }
-      for (let d of defaultDates) {
-        await slotsCollection.insertOne({ priestName, date: d, maxSlots: 5, bookedCount: 0 });
-      }
-      slots = await slotsCollection.find({ priestName }).toArray();
-    }
-
     const formattedSlots = slots
+      .filter(s => s.bookedCount < s.maxSlots)
       .map(s => ({
+        _id: s._id,
         date: s.date,
-        slotsLeft: s.maxSlots - s.bookedCount
-      }))
-      .filter(s => s.slotsLeft > 0);
+        startTime: s.startTime,
+        maxSlots: s.maxSlots,
+        bookedCount: s.bookedCount
+      }));
 
     res.json(formattedSlots);
   } catch (err) {
@@ -241,9 +282,14 @@ app.get("/api/priest-slots", async (req, res) => {
 
 app.post("/api/bookings", async (req, res) => {
   try {
-    const { userId, priestName, date } = req.body;
+    const {
+      userId,
+      priestName,
+      date,
+      startTime
+    } = req.body;
 
-    const slotsCollection = db.collection("slots");
+    const slotsCollection = db.collection("priestSlots");
     const bookingsCollection = db.collection("bookings");
 
     const existingBooking = await bookingsCollection.findOne({
@@ -272,7 +318,13 @@ app.post("/api/bookings", async (req, res) => {
       });
     }
 
-    if (slot.bookedCount >= slot.maxSlots) {
+    const acceptedCount = await bookingsCollection.countDocuments({
+      priestName,
+      date,
+      status: "accepted"
+    });
+
+    if (acceptedCount >= slot.maxSlots) {
       return res.status(400).json({
         success: false,
         error: "اكتمل العدد لهذا الموعد"
@@ -283,21 +335,10 @@ app.post("/api/bookings", async (req, res) => {
       userId: new ObjectId(userId),
       priestName,
       date,
+      startTime,
       status: "pending",
-      queueNumber: null,
       createdAt: new Date()
     });
-
-    await slotsCollection.updateOne(
-      {
-        _id: slot._id
-      },
-      {
-        $inc: {
-          bookedCount: 1
-        }
-      }
-    );
 
     res.json({
       success: true,
@@ -320,6 +361,40 @@ app.get("/api/user-bookings/:userId", async (req, res) => {
     res.json(bookings);
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get("/api/priest-slots/:priestName", async (req, res) => {
+  try {
+    const slots = await db
+      .collection("priestSlots")
+      .find({ priestName: req.params.priestName })
+      .sort({ date: 1 })
+      .toArray();
+
+    res.json(slots);
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
+app.delete("/api/priest-slots/:id", async (req, res) => {
+  try {
+    await db.collection("priestSlots").deleteOne({
+      _id: new ObjectId(req.params.id)
+    });
+
+    res.json({
+      success: true
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
   }
 });
 
@@ -396,13 +471,27 @@ app.get("/api/priest-users/:priestName", async (req, res) => {
   }
 });
 
+app.get("/api/priests", async (req, res) => {
+  try {
+    const priests = await db
+      .collection("priests")
+      .find({}, { projection: { password: 0 } })
+      .toArray();
+
+    res.json(priests);
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
+  }
+});
+
 app.patch("/api/bookings/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
-
     const bookingsCollection = db.collection("bookings");
-    const slotsCollection = db.collection("slots");
 
     const booking = await bookingsCollection.findOne({
       _id: new ObjectId(id)
@@ -415,15 +504,24 @@ app.patch("/api/bookings/:id", async (req, res) => {
       });
     }
 
-    if (booking.status === status) {
-      return res.json({
-        success: true
-      });
-    }
-
-    let queueNumber = booking.queueNumber;
-
     if (status === "accepted") {
+      if (booking.status === "accepted") {
+        return res.status(400).json({
+          success: false,
+          error: "تم قبول هذا الحجز بالفعل"
+        });
+      }
+      const slot = await db.collection("priestSlots").findOne({
+        priestName: booking.priestName,
+        date: booking.date
+      });
+
+      if (!slot) {
+        return res.status(400).json({
+          success: false,
+          error: "الموعد غير موجود"
+        });
+      }
 
       const acceptedCount = await bookingsCollection.countDocuments({
         priestName: booking.priestName,
@@ -431,15 +529,38 @@ app.patch("/api/bookings/:id", async (req, res) => {
         status: "accepted"
       });
 
-      queueNumber = acceptedCount + 1;
+      if (acceptedCount >= slot.maxSlots) {
+        return res.status(400).json({
+          success: false,
+          error: "اكتمل العدد"
+        });
+      }
 
-    }
+      await bookingsCollection.updateOne(
+        {
+          _id: new ObjectId(id)
+        },
+        {
+          $set: {
+            status: "accepted",
+            queueNumber: acceptedCount + 1
+          }
+        }
+      );
 
-    if (status === "rejected") {
-
-      if (booking.status !== "rejected") {
-
-        await slotsCollection.updateOne(
+      await db.collection("priestSlots").updateOne(
+        {
+          _id: slot._id
+        },
+        {
+          $inc: {
+            bookedCount: 1
+          }
+        }
+      );
+    } else {
+      if (booking.status === "accepted") {
+        await db.collection("priestSlots").updateOne(
           {
             priestName: booking.priestName,
             date: booking.date
@@ -450,55 +571,40 @@ app.patch("/api/bookings/:id", async (req, res) => {
             }
           }
         );
-
       }
 
-      if (booking.queueNumber) {
+      await bookingsCollection.deleteOne({
+        _id: new ObjectId(id)
+      });
 
-        await bookingsCollection.updateMany(
+      const acceptedBookings = await bookingsCollection
+        .find({
+          priestName: booking.priestName,
+          date: booking.date,
+          status: "accepted"
+        })
+        .sort({ queueNumber: 1 })
+        .toArray();
+
+      for (let i = 0; i < acceptedBookings.length; i++) {
+        await bookingsCollection.updateOne(
           {
-            priestName: booking.priestName,
-            date: booking.date,
-            queueNumber: {
-              $gt: booking.queueNumber
-            }
+            _id: acceptedBookings[i]._id
           },
           {
-            $inc: {
-              queueNumber: -1
+            $set: {
+              queueNumber: i + 1
             }
           }
         );
-
       }
-
-      queueNumber = null;
-
     }
 
-    await bookingsCollection.updateOne(
-      {
-        _id: booking._id
-      },
-      {
-        $set: {
-          status,
-          queueNumber
-        }
-      }
-    );
-
-    const updatedBooking = await bookingsCollection.findOne({
-      _id: booking._id
-    });
-
     res.json({
-      success: true,
-      booking: updatedBooking
+      success: true
     });
 
   } catch (err) {
-
     res.status(500).json({
       success: false,
       error: err.message
