@@ -108,7 +108,13 @@ app.get("/api/priest-slots", async (req, res) => {
     let slots = await Slot.find({ priestName });
 
     if (slots.length === 0) {
-      const defaultDates = ["2026-06-10", "2026-06-12", "2026-06-15", "2026-06-17"];
+      const today = new Date();
+      const defaultDates = [];
+      for (let i = 1; i <= 7; i++) {
+        const d = new Date(today);
+        d.setDate(today.getDate() + i);
+        defaultDates.push(d.toISOString().split("T")[0]);
+      }
       for (let d of defaultDates) {
         await Slot.create({ priestName, date: d, maxSlots: 5, bookedCount: 0 });
       }
@@ -130,8 +136,12 @@ app.post("/api/bookings", async (req, res) => {
   try {
     const { userId, priestName, date } = req.body;
     
-    const slot = await Slot.findOne({ priestName, date });
-    if (!slot || slot.bookedCount >= slot.maxSlots) {
+    let slot = await Slot.findOne({ priestName, date });
+    if (!slot) {
+      slot = await Slot.create({ priestName, date, maxSlots: 5, bookedCount: 0 });
+    }
+
+    if (slot.bookedCount >= slot.maxSlots) {
       return res.status(400).json({ success: false, error: "عذراً، هذا الموعد لم يعد متاحاً أو اكتمل العدد" });
     }
 
@@ -143,6 +153,10 @@ app.post("/api/bookings", async (req, res) => {
     });
 
     await newBooking.save();
+    
+    slot.bookedCount += 1;
+    await slot.save();
+
     res.json({ success: true, bookingId: newBooking._id });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -192,7 +206,7 @@ app.get("/api/priest-users/:priestName", async (req, res) => {
 
     res.json(Array.from(usersMap.values()));
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false,, error: err.message });
   }
 });
 
@@ -213,11 +227,12 @@ app.patch("/api/bookings/:id", async (req, res) => {
         status: "accepted"
       });
       booking.queueNumber = acceptedCount + 1;
-
+    } else if (status === "rejected" && booking.status === "accepted") {
       await Slot.findOneAndUpdate(
         { priestName: booking.priestName, date: booking.date },
-        { $inc: { bookedCount: 1 } }
+        { $inc: { bookedCount: -1 } }
       );
+      booking.queueNumber = null;
     }
 
     booking.status = status;
