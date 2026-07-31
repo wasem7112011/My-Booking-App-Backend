@@ -1,10 +1,41 @@
 const express = require("express");
+const http = require("http");
+const { Server } = require("socket.io");
 const { MongoClient, ObjectId } = require("mongodb");
 const cors = require("cors");
 const bcrypt = require("bcrypt");
 require("dotenv").config();
 
 const app = express();
+const server = http.createServer(app);
+
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+
+// كل عميل (كاهن أو مستخدم) بينضم لغرفة خاصة به عشان يوصله بس الأحداث اللي تخصه
+io.on("connection", (socket) => {
+  socket.on("join", (room) => {
+    if (room) socket.join(room);
+  });
+
+  socket.on("leave", (room) => {
+    if (room) socket.leave(room);
+  });
+});
+
+function notifyPriest(priestName, event, payload) {
+  if (!priestName) return;
+  io.to(`priest:${priestName}`).emit(event, payload || {});
+}
+
+function notifyUser(userId, event, payload) {
+  if (!userId) return;
+  io.to(`user:${userId.toString()}`).emit(event, payload || {});
+}
 
 app.use(cors({
   origin: "*", 
@@ -22,6 +53,16 @@ let db;
 async function deleteExpiredBookings() {
   const today = new Date().toISOString().split("T")[0];
 
+  const expiredBookingsCount = await db.collection("bookings").countDocuments({
+    date: { $lt: today }
+  });
+
+  const expiredSlotsCount = await db.collection("priestSlots").countDocuments({
+    date: { $lt: today }
+  });
+
+  if (expiredBookingsCount === 0 && expiredSlotsCount === 0) return;
+
   await db.collection("bookings").deleteMany({
     date: { $lt: today }
   });
@@ -29,6 +70,9 @@ async function deleteExpiredBookings() {
   await db.collection("priestSlots").deleteMany({
     date: { $lt: today }
   });
+
+  // بث عام صامت لتحديث الواجهات المفتوحة بعد تنظيف المواعيد المنتهية
+  io.emit("cleanup");
 }
 
 async function startServer() {  
@@ -46,10 +90,10 @@ async function startServer() {
       } catch (err) {
         console.error(err);
       }
-    }, 1000 * 60 * 60);
+    }, 1000 * 60 * 5); // كل 5 دقايق بدل الساعة، عشان توفير المساحة بسرعة أكبر
 
     const PORT = process.env.PORT || 5000;
-    app.listen(PORT, () => {
+    server.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);
     });
   } catch (err) {
@@ -75,7 +119,17 @@ app.get("/api/users/:id", async (req, res) => {
 
 app.post("/api/register", async (req, res) => {
   try {
-    const { fullName, birthDate, phone, password } = req.body;
+    const {
+      fullName,
+      birthDate,
+      phone,
+      password,
+      address,
+      educationStage,
+      churchGroup,
+      job,
+      church
+    } = req.body;
 
     const usersCollection = db.collection("users");
 
@@ -94,7 +148,12 @@ app.post("/api/register", async (req, res) => {
       fullName,
       birthDate,
       phone,
-      password: hashedPassword
+      password: hashedPassword,
+      address: address || "",
+      educationStage: educationStage || "",
+      churchGroup: churchGroup || "",
+      job: job || "",
+      church: church || ""
     });
 
     res.json({
@@ -167,6 +226,9 @@ app.post("/api/priest-slots", async (req, res) => {
       bookedCount: 0,
       createdAt: new Date()
     });
+
+    notifyPriest(priestName, "slots-updated");
+    notifyPriest(priestName, "new-slot", { date, startTime });
 
     res.json({
       success: true
@@ -271,7 +333,8 @@ app.get("/api/priest-slots", async (req, res) => {
         date: s.date,
         startTime: s.startTime,
         maxSlots: s.maxSlots,
-        bookedCount: s.bookedCount
+        bookedCount: s.bookedCount,
+        slotsLeft: s.maxSlots - s.bookedCount
       }));
 
     res.json(formattedSlots);
@@ -318,13 +381,7 @@ app.post("/api/bookings", async (req, res) => {
       });
     }
 
-    const acceptedCount = await bookingsCollection.countDocuments({
-      priestName,
-      date,
-      status: "accepted"
-    });
-
-    if (acceptedCount >= slot.maxSlots) {
+    if (slot.bookedCount >= slot.maxSlots) {
       return res.status(400).json({
         success: false,
         error: "اكتمل العدد لهذا الموعد"
@@ -339,6 +396,11 @@ app.post("/api/bookings", async (req, res) => {
       status: "pending",
       createdAt: new Date()
     });
+
+    const user = await db.collection("users").findOne({ _id: new ObjectId(userId) });
+
+    notifyPriest(priestName, "bookings-updated");
+    notifyPriest(priestName, "new-booking", { fullName: user?.fullName || "شخص", date });
 
     res.json({
       success: true,
@@ -372,7 +434,16 @@ app.get("/api/priest-slots/:priestName", async (req, res) => {
       .sort({ date: 1 })
       .toArray();
 
-    res.json(slots);
+    const formatted = slots.map(s => ({
+      _id: s._id,
+      date: s.date,
+      startTime: s.startTime,
+      maxSlots: s.maxSlots,
+      bookedCount: s.bookedCount,
+      slotsLeft: s.maxSlots - s.bookedCount
+    }));
+
+    res.json(formatted);
   } catch (err) {
     res.status(500).json({
       success: false,
@@ -383,9 +454,17 @@ app.get("/api/priest-slots/:priestName", async (req, res) => {
 
 app.delete("/api/priest-slots/:id", async (req, res) => {
   try {
+    const slot = await db.collection("priestSlots").findOne({
+      _id: new ObjectId(req.params.id)
+    });
+
     await db.collection("priestSlots").deleteOne({
       _id: new ObjectId(req.params.id)
     });
+
+    if (slot) {
+      notifyPriest(slot.priestName, "slots-updated");
+    }
 
     res.json({
       success: true
@@ -471,6 +550,46 @@ app.get("/api/priest-users/:priestName", async (req, res) => {
   }
 });
 
+// سجل المعترفين الدائم لكل كاهن - يتغذى عند تسجيل نتيجة الاعتراف
+app.get("/api/confessors/:priestName", async (req, res) => {
+  try {
+    const priestName = decodeURIComponent(req.params.priestName);
+
+    const confessors = await db
+      .collection("confessors")
+      .find({ priestName })
+      .sort({ fullName: 1 })
+      .toArray();
+
+    res.json(confessors);
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// حذف معترف من السجل بمعرفة الكاهن
+app.delete("/api/confessors/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const confessor = await db.collection("confessors").findOne({
+      _id: new ObjectId(id)
+    });
+
+    if (!confessor) {
+      return res.status(404).json({ success: false, error: "السجل غير موجود" });
+    }
+
+    await db.collection("confessors").deleteOne({ _id: new ObjectId(id) });
+
+    notifyPriest(confessor.priestName, "confessors-updated");
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.get("/api/priests", async (req, res) => {
   try {
     const priests = await db
@@ -523,18 +642,14 @@ app.patch("/api/bookings/:id", async (req, res) => {
         });
       }
 
-      const acceptedCount = await bookingsCollection.countDocuments({
-        priestName: booking.priestName,
-        date: booking.date,
-        status: "accepted"
-      });
-
-      if (acceptedCount >= slot.maxSlots) {
+      if (slot.bookedCount >= slot.maxSlots) {
         return res.status(400).json({
           success: false,
           error: "اكتمل العدد"
         });
       }
+
+      const queueNumber = slot.bookedCount + 1;
 
       await bookingsCollection.updateOne(
         {
@@ -543,7 +658,7 @@ app.patch("/api/bookings/:id", async (req, res) => {
         {
           $set: {
             status: "accepted",
-            queueNumber: acceptedCount + 1
+            queueNumber
           }
         }
       );
@@ -558,8 +673,19 @@ app.patch("/api/bookings/:id", async (req, res) => {
           }
         }
       );
+
+      notifyPriest(booking.priestName, "bookings-updated");
+      notifyPriest(booking.priestName, "slots-updated");
+      notifyUser(booking.userId, "booking-status", {
+        status: "accepted",
+        priestName: booking.priestName,
+        date: booking.date,
+        queueNumber
+      });
     } else {
-      if (booking.status === "accepted") {
+      const wasAccepted = booking.status === "accepted";
+
+      if (wasAccepted) {
         await db.collection("priestSlots").updateOne(
           {
             priestName: booking.priestName,
@@ -598,6 +724,16 @@ app.patch("/api/bookings/:id", async (req, res) => {
           }
         );
       }
+
+      notifyPriest(booking.priestName, "bookings-updated");
+      if (wasAccepted) {
+        notifyPriest(booking.priestName, "slots-updated");
+      }
+      notifyUser(booking.userId, "booking-status", {
+        status: "rejected",
+        priestName: booking.priestName,
+        date: booking.date
+      });
     }
 
     res.json({
@@ -609,5 +745,94 @@ app.patch("/api/bookings/:id", async (req, res) => {
       success: false,
       error: err.message
     });
+  }
+});
+
+// تسجيل نتيجة الاعتراف لحجز مقبول: يضيف المعترف لأول مرة أو يحدّث بياناته
+// فقط لو موجود بالفعل (نفس priestName + userId)، ثم يحذف الحجز من قاعدة
+// البيانات في الحالتين (اعترف / لم يعترف)
+app.post("/api/bookings/:id/confession", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { confessed } = req.body;
+
+    const bookingsCollection = db.collection("bookings");
+    const usersCollection = db.collection("users");
+    const confessorsCollection = db.collection("confessors");
+
+    const booking = await bookingsCollection.findOne({ _id: new ObjectId(id) });
+
+    if (!booking) {
+      return res.status(404).json({ success: false, error: "الحجز غير موجود" });
+    }
+
+    if (booking.status !== "accepted") {
+      return res.status(400).json({ success: false, error: "هذا الحجز غير مقبول بعد" });
+    }
+
+    const user = await usersCollection.findOne({ _id: booking.userId });
+
+    const today = new Date().toISOString().split("T")[0];
+
+    const confessorData = {
+      priestName: booking.priestName,
+      userId: booking.userId,
+      fullName: user?.fullName || "",
+      phone: user?.phone || "",
+      birthDate: user?.birthDate || "",
+      address: user?.address || "",
+      educationStage: user?.educationStage || "",
+      churchGroup: user?.churchGroup || "",
+      job: user?.job || "",
+      church: user?.church || "",
+      updatedAt: new Date()
+    };
+
+    if (confessed) {
+      confessorData.lastConfessionDate = today;
+    }
+
+    // upsert بمفتاح (priestName + userId): لو موجود بيتحدّث بس، مش بيتضاف تاني
+    await confessorsCollection.updateOne(
+      { priestName: booking.priestName, userId: booking.userId },
+      {
+        $set: confessorData,
+        $setOnInsert: { createdAt: new Date() }
+      },
+      { upsert: true }
+    );
+
+    // ملاحظة: لا يتم إنقاص bookedCount هنا عمدًا — بمجرد قبول الحجز يُحتسب
+    // المكان "مستهلك" نهائيًا لهذا اليوم، حتى بعد تسجيل نتيجة الاعتراف وحذف الحجز
+    await bookingsCollection.deleteOne({ _id: new ObjectId(id) });
+
+    const acceptedBookings = await bookingsCollection
+      .find({
+        priestName: booking.priestName,
+        date: booking.date,
+        status: "accepted"
+      })
+      .sort({ queueNumber: 1 })
+      .toArray();
+
+    for (let i = 0; i < acceptedBookings.length; i++) {
+      await bookingsCollection.updateOne(
+        { _id: acceptedBookings[i]._id },
+        { $set: { queueNumber: i + 1 } }
+      );
+    }
+
+    notifyPriest(booking.priestName, "bookings-updated");
+    notifyPriest(booking.priestName, "slots-updated");
+    notifyPriest(booking.priestName, "confessors-updated");
+    notifyUser(booking.userId, "booking-status", {
+      status: "closed",
+      priestName: booking.priestName,
+      date: booking.date
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
   }
 });
