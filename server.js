@@ -197,13 +197,19 @@ async function deleteExpiredBookings() {
 
 async function startServer() {  
   try {
+    const PORT = process.env.PORT || 5000;
+    
+    server.listen(PORT, () => {
+      console.log(`Server is running on port ${PORT}`);
+    });
+
     await client.connect();
     db = client.db();
-
+    
     console.log("Connected to MongoDB successfully");
 
     await deleteExpiredBookings();
-
+    
     setInterval(async () => {
       try {
         await deleteExpiredBookings();
@@ -212,10 +218,6 @@ async function startServer() {
       }
     }, 1000 * 60 * 5);
 
-    const PORT = process.env.PORT || 5000;
-    server.listen(PORT, () => {
-      console.log(`Server is running on port ${PORT}`);
-    });
   } catch (err) {
     console.error("MongoDB connection error:", err);
   }
