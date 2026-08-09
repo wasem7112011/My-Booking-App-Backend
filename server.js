@@ -5,15 +5,23 @@ const jwt = require("jsonwebtoken");
 const { MongoClient, ObjectId } = require("mongodb");
 const cors = require("cors");
 const bcrypt = require("bcrypt");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
 require("dotenv").config();
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
+const CORS_ORIGIN = process.env.CORS_ORIGIN;
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
 if (!JWT_SECRET) {
   console.warn(
     "تحذير: متغير البيئة JWT_SECRET غير موجود. لازم تحطه في .env قبل النشر (JWT_SECRET=نص عشوائي طويل)."
   );
+  if (IS_PRODUCTION) {
+    console.error("إيقاف السيرفر: لا يمكن التشغيل في وضع الإنتاج بدون JWT_SECRET.");
+    process.exit(1);
+  }
 }
 
 if (!ADMIN_SECRET) {
@@ -22,12 +30,23 @@ if (!ADMIN_SECRET) {
   );
 }
 
+if (!CORS_ORIGIN) {
+  console.warn(
+    "تحذير: متغير البيئة CORS_ORIGIN غير موجود. السيرفر هيقبل طلبات من أي دومين (*) — مناسب للتجربة بس مش موصى بيه في الإنتاج."
+  );
+}
+
+function handleError(res, err, status = 500) {
+  console.error(err);
+  res.status(status).json({ success: false, error: "حدث خطأ في السيرفر، حاول مرة أخرى" });
+}
+
 const app = express();
 const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: "*",
+    origin: CORS_ORIGIN || "*",
     methods: ["GET", "POST"]
   }
 });
@@ -129,13 +148,23 @@ function notifyUser(userId, event, payload) {
   io.to(`user:${userId.toString()}`).emit(event, payload || {});
 }
 
+app.use(helmet());
+
 app.use(cors({
-  origin: "*", 
+  origin: CORS_ORIGIN || "*",
   methods: ["GET", "POST", "PATCH", "DELETE", "PUT"],
   allowedHeaders: ["Content-Type", "Authorization", "x-admin-secret"]
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: "محاولات كثيرة جدًا، حاول تاني بعد شوية" }
+});
 
 const MONGO_URI = process.env.MONGO_URI || "mongodb://localhost:27017/booking-app";
 const client = new MongoClient(MONGO_URI);
@@ -194,7 +223,7 @@ async function startServer() {
 
 startServer();
 
-app.post("/api/register", async (req, res) => {
+app.post("/api/register", authLimiter, async (req, res) => {
   try {
     const {
       fullName,
@@ -245,14 +274,11 @@ app.post("/api/register", async (req, res) => {
       userId: result.insertedId
     });
   } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
+    handleError(res, err);
   }
 });
 
-app.post("/api/create-priest", requireAdminSecret, async (req, res) => {
+app.post("/api/create-priest", authLimiter, requireAdminSecret, async (req, res) => {
   try {
     const { name, password } = req.body;
 
@@ -286,14 +312,11 @@ app.post("/api/create-priest", requireAdminSecret, async (req, res) => {
       priestId: result.insertedId
     });
   } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
+    handleError(res, err);
   }
 });
 
-app.post("/api/login", async (req, res) => {
+app.post("/api/login", authLimiter, async (req, res) => {
   try {
     const { phone, password } = req.body;
 
@@ -332,14 +355,11 @@ app.post("/api/login", async (req, res) => {
       }
     });
   } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
+    handleError(res, err);
   }
 });
 
-app.post("/api/priest-login", async (req, res) => {
+app.post("/api/priest-login", authLimiter, async (req, res) => {
   try {
     const { name, password } = req.body;
 
@@ -378,10 +398,7 @@ app.post("/api/priest-login", async (req, res) => {
       }
     });
   } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
+    handleError(res, err);
   }
 });
 
@@ -394,10 +411,7 @@ app.get("/api/priests", async (req, res) => {
 
     res.json(priests);
   } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
+    handleError(res, err);
   }
 });
 
@@ -411,7 +425,7 @@ app.get("/api/users/:id", authenticate, requireSelfUser("id"), async (req, res) 
     }
     res.json({ success: true, user: { id: user._id, fullName: user.fullName } });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    handleError(res, err);
   }
 });
 
@@ -422,13 +436,18 @@ app.get("/api/user-bookings/:userId", authenticate, requireSelfUser("userId"), a
     const bookings = await bookingsCollection.find({ userId: new ObjectId(userId) }).toArray();
     res.json(bookings);
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    handleError(res, err);
   }
 });
 
 app.get("/api/priest-slots", authenticate, async (req, res) => {
   try {
     const { priestName } = req.query;
+
+    if (typeof priestName !== "string" || !priestName) {
+      return res.status(400).json({ success: false, error: "بيانات غير صحيحة" });
+    }
+
     const slotsCollection = db.collection("priestSlots");
 
     let slots = await slotsCollection.find({ priestName }).toArray();
@@ -446,7 +465,7 @@ app.get("/api/priest-slots", authenticate, async (req, res) => {
 
     res.json(formattedSlots);
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    handleError(res, err);
   }
 });
 
@@ -454,6 +473,14 @@ app.post("/api/bookings", authenticate, requireRole("user"), async (req, res) =>
   try {
     const userId = req.auth.id;
     const { priestName, date, startTime } = req.body;
+
+    if (
+      typeof priestName !== "string" || !priestName ||
+      typeof date !== "string" || !date ||
+      typeof startTime !== "string" || !startTime
+    ) {
+      return res.status(400).json({ success: false, error: "بيانات غير صحيحة" });
+    }
 
     const slotsCollection = db.collection("priestSlots");
     const bookingsCollection = db.collection("bookings");
@@ -511,10 +538,7 @@ app.post("/api/bookings", authenticate, requireRole("user"), async (req, res) =>
     });
 
   } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
+    handleError(res, err);
   }
 });
 
@@ -522,12 +546,21 @@ app.post("/api/priest-slots", authenticate, requireRole("priest"), async (req, r
   try {
     const priestName = req.auth.name;
     const { date, startTime, slotsLeft } = req.body;
+    const maxSlots = Number(slotsLeft);
+
+    if (
+      typeof date !== "string" || !date ||
+      typeof startTime !== "string" || !startTime ||
+      !Number.isFinite(maxSlots) || maxSlots <= 0
+    ) {
+      return res.status(400).json({ success: false, error: "بيانات غير صحيحة" });
+    }
 
     await db.collection("priestSlots").insertOne({
       priestName,
       date,
       startTime,
-      maxSlots: Number(slotsLeft),
+      maxSlots,
       bookedCount: 0,
       createdAt: new Date()
     });
@@ -539,10 +572,7 @@ app.post("/api/priest-slots", authenticate, requireRole("priest"), async (req, r
       success: true
     });
   } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
+    handleError(res, err);
   }
 });
 
@@ -565,10 +595,7 @@ app.get("/api/priest-slots/:priestName", authenticate, requireSelfPriest("priest
 
     res.json(formatted);
   } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
+    handleError(res, err);
   }
 });
 
@@ -596,10 +623,7 @@ app.delete("/api/priest-slots/:id", authenticate, requireRole("priest"), async (
       success: true
     });
   } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
+    handleError(res, err);
   }
 });
 
@@ -636,7 +660,7 @@ app.get("/api/bookings/:priestName", authenticate, requireSelfPriest("priestName
 
     res.json(formatted);
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    handleError(res, err);
   }
 });
 
@@ -652,7 +676,7 @@ app.get("/api/confessors/:priestName", authenticate, requireSelfPriest("priestNa
 
     res.json(confessors);
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    handleError(res, err);
   }
 });
 
@@ -678,7 +702,7 @@ app.delete("/api/confessors/:id", authenticate, requireRole("priest"), async (re
 
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    handleError(res, err);
   }
 });
 
@@ -821,10 +845,7 @@ app.patch("/api/bookings/:id", authenticate, requireRole("priest"), async (req, 
     });
 
   } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
+    handleError(res, err);
   }
 });
 
@@ -911,6 +932,6 @@ app.post("/api/bookings/:id/confession", authenticate, requireRole("priest"), as
     
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    handleError(res, err);
   }
 });
