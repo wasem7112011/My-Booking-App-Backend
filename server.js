@@ -166,7 +166,7 @@ const authLimiter = rateLimit({
   message: { success: false, error: "محاولات كثيرة جدًا، حاول تاني بعد شوية" }
 });
 
-const MONGO_URI = process.env.MONGO_URI || "mongodb://Wasem:W7112011@ac-ndrabk6-shard-00-00.cqnutf2.mongodb.net:27017,ac-ndrabk6-shard-00-01.cqnutf2.mongodb.net:27017,ac-ndrabk6-shard-00-02.cqnutf2.mongodb.net:27017/?ssl=true&replicaSet=atlas-kgbw1h-shard-0&authSource=admin&appName=FirstCluster";
+const MONGO_URI = process.env.MONGO_URI || "mongodb://localhost:27017/booking-app";
 const client = new MongoClient(MONGO_URI);
 
 let db;
